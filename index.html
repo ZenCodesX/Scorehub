@@ -191,6 +191,12 @@ tr.hl td{background:color-mix(in srgb,var(--accent) 14%,transparent)}
 .hsearch input{font-size:14.5px}
 .clr{background:var(--chip);border:0;border-radius:50%;width:22px;height:22px;font-size:11px;cursor:pointer;color:var(--muted);display:grid;place-items:center}
 .obsearch{margin:14px 22px 0;box-shadow:none;background:var(--chip);border-radius:12px;padding:10px 12px}
+.field{display:block;width:100%;background:var(--chip);border:0;border-radius:12px;padding:13px 14px;font:inherit;font-size:15px;color:var(--text);margin-top:10px;outline:none}
+.field:focus{box-shadow:inset 0 0 0 2px var(--accent)}
+.amsg{font-size:13px;margin-top:12px;color:var(--muted);line-height:1.45}
+.amsg.err{color:var(--red)}
+.acct{display:flex;align-items:center;gap:12px;padding:14px 16px}
+.avatar{width:40px;height:40px;flex:0 0 auto;border-radius:50%;background:var(--accent);color:#fff;display:grid;place-items:center;font-weight:800;font-size:16px}
 @media (max-width:480px){.row{grid-template-columns:38px 1fr 58px 1fr 24px;padding-left:10px;gap:6px}.tm{gap:6px;font-size:13px}.pl{width:58px;font-size:9px}.ob .sheet{border-radius:0;height:100%}}
 </style>
 </head>
@@ -212,6 +218,7 @@ tr.hl td{background:color-mix(in srgb,var(--accent) 14%,transparent)}
 <div id="toasts"></div>
 <div id="modal"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 /* ================= utilities ================= */
 const $ = s => document.querySelector(s);
@@ -387,10 +394,144 @@ let F = store.get('follows', {teams:[], leagues:[], matches:[]});
 let P = store.get('prefs2', {goal:true, card:true, ht:false, ft:true, ko:true, big:false, dark:false});
 let NOTES = [];
 const fol = (k, id) => F[k].includes(id);
-function toggleFollow(k, id){ F[k] = fol(k,id) ? F[k].filter(x=>x!==id) : [...F[k], id]; store.set('follows', F); }
+function toggleFollow(k, id){ const on = !fol(k,id); F[k] = on ? [...F[k], id] : F[k].filter(x=>x!==id); store.set('follows', F); pushFollow(k, id, on); }
 const teamFollowed = m => fol('teams',m.home) || fol('teams',m.away);
 const matchFollowed = m => teamFollowed(m) || fol('matches',m.id) || fol('leagues',m.lg);
 const isLive = m => m.status==='LIVE' || m.status==='HT';
+
+/* ================= account (Supabase Auth) ================= */
+// Public project URL + publishable key: safe to ship in a client app. Row level security protects the data.
+const SUPABASE_URL = 'https://dkjyqpkcvczbhddvgpzj.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_9Xivksxoehz6PCVtCAfSnw_3cTZxAtu';
+let sb = null, USER = null, PROFILE = null;
+try { if (window.supabase && window.supabase.createClient) sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY); } catch(e) { sb = null; }
+const K2T = {teams:'team', leagues:'competition', matches:'fixture'}, T2K = {team:'teams', competition:'leagues', fixture:'matches'};
+const P2DB = {goal:'goals', card:'red_cards', ko:'kickoff', ht:'half_time', ft:'full_time', big:'big_moments_only'};
+const NET_MSG = "Couldn't reach the ScoreLine server. Check your connection. Sign-in doesn't work inside the Claude preview, so open the app from GitHub Pages or a local copy.";
+function info(msg){ const el = document.createElement('div'); el.className = 'toast'; el.innerHTML = `<span class="ti">✓</span><div><b>${esc(msg)}</b></div>`; $('#toasts').prepend(el); setTimeout(()=>el.remove(), 4000); }
+
+async function pullAccount(mergeLocal){
+  if (!sb || !USER) return;
+  const [fr, nr, pr] = await Promise.all([
+    sb.from('follows').select('entity_type,entity_id'),
+    sb.from('notification_settings').select('*').maybeSingle(),
+    sb.from('profiles').select('display_name,theme,onboarded').maybeSingle()
+  ]);
+  if (fr.error){ info("Couldn't load your saved teams"); return; }
+  const remote = {teams:[], leagues:[], matches:[]};
+  for (const r of fr.data){ const k = T2K[r.entity_type]; if (k) remote[k].push(r.entity_id); }
+  if (mergeLocal){
+    const add = [];
+    for (const k of Object.keys(K2T)) for (const id of F[k]) if (!remote[k].includes(id)) add.push({user_id:USER.id, entity_type:K2T[k], entity_id:id});
+    if (add.length){ const {error} = await sb.from('follows').upsert(add, {onConflict:'user_id,entity_type,entity_id', ignoreDuplicates:true}); if (error) console.warn(error); }
+    for (const k of Object.keys(K2T)) F[k] = [...new Set([...remote[k], ...F[k]])];
+  } else {
+    for (const k of Object.keys(K2T)) F[k] = remote[k];
+  }
+  store.set('follows', F);
+  if (nr.data) for (const [p,c] of Object.entries(P2DB)) P[p] = !!nr.data[c];
+  if (pr.data){ PROFILE = pr.data; P.dark = pr.data.theme === 'dark'; }
+  store.set('prefs2', P); applyTheme();
+  if (F.teams.length || F.leagues.length || (PROFILE && PROFILE.onboarded)){
+    store.set('onboarded', true);
+    if ($('#modal .ob') && OB.step === 'welcome') $('#modal').innerHTML = '';
+    if (PROFILE && !PROFILE.onboarded){ PROFILE.onboarded = true; sb.from('profiles').update({onboarded:true}).eq('id', USER.id).then(()=>{}); }
+  }
+  render();
+}
+function pushFollow(k, id, on){
+  if (!sb || !USER || !K2T[k]) return;
+  const row = {user_id:USER.id, entity_type:K2T[k], entity_id:id};
+  const q = on ? sb.from('follows').upsert(row, {onConflict:'user_id,entity_type,entity_id', ignoreDuplicates:true}) : sb.from('follows').delete().match(row);
+  q.then(({error}) => { if (error) info("Couldn't save that to your account"); });
+}
+function pushPref(p){
+  if (!sb || !USER) return;
+  const q = p === 'dark' ? sb.from('profiles').update({theme: P.dark ? 'dark' : 'light'}).eq('id', USER.id)
+          : P2DB[p] ? sb.from('notification_settings').update({[P2DB[p]]: P[p]}).eq('user_id', USER.id) : null;
+  if (q) q.then(({error}) => { if (error) info("Couldn't save that setting to your account"); });
+}
+async function pushAllFollows(){
+  if (!sb || !USER) return;
+  for (const k of ['teams','leagues']){
+    let del = sb.from('follows').delete().eq('user_id', USER.id).eq('entity_type', K2T[k]);
+    if (F[k].length) del = del.not('entity_id', 'in', `(${F[k].map(x=>`"${x}"`).join(',')})`);
+    await del;
+    if (F[k].length) await sb.from('follows').upsert(F[k].map(id=>({user_id:USER.id, entity_type:K2T[k], entity_id:id})), {onConflict:'user_id,entity_type,entity_id', ignoreDuplicates:true});
+  }
+  await sb.from('profiles').update({onboarded:true}).eq('id', USER.id);
+}
+
+const AUTH = {mode:'signin', msg:'', err:false, busy:false, email:'', from:null};
+function openAuth(mode, from){ AUTH.mode = mode || 'signin'; AUTH.msg = ''; AUTH.err = false; AUTH.busy = false; AUTH.from = from || null; drawAuth(); }
+function closeAuth(){ if (AUTH.from === 'welcome' && !USER) return drawOb(); $('#modal').innerHTML = ''; }
+function authMsg(m, err){ AUTH.msg = m; AUTH.err = !!err; AUTH.busy = false; drawAuth(); }
+function friendlyAuthError(e){
+  const m = (e && e.message) || '';
+  if (/fetch|network|Load failed/i.test(m)) return NET_MSG;
+  if (/invalid login/i.test(m)) return 'Wrong email or password.';
+  if (/not confirmed/i.test(m)) return 'Please confirm your email first, using the link we sent you.';
+  if (/already registered|already exists/i.test(m)) return 'That email already has an account. Sign in instead.';
+  if (/rate limit|too many/i.test(m)) return 'Too many attempts. Please wait a minute and try again.';
+  if (/password/i.test(m)) return m;
+  return m || 'Something went wrong. Please try again.';
+}
+function drawAuth(){
+  const A = AUTH, up = A.mode==='signup', reset = A.mode==='reset', np = A.mode==='newpass';
+  const title = up ? 'Create account' : reset ? 'Reset password' : np ? 'Set a new password' : 'Sign in';
+  const sub = up ? 'Save your teams and alerts across devices.' : reset ? "We'll email you a link to reset it." : np ? 'Choose a new password for your account.' : 'Welcome back.';
+  const body = !sb
+    ? `<div class="obhead"><h2>Sign in</h2><p>Sign-in couldn't load here. Open the app from GitHub Pages or a local copy to use your account.</p></div><div class="grow"></div><div class="obfoot"><button class="qs" data-authclose>Close <span style="display:grid">${I.arrow}</span></button></div>`
+    : `<div class="obhead"><h2>${title}</h2><p>${sub}</p></div>
+      <form id="authform" style="padding:14px 22px 0" novalidate>
+        ${up ? `<input class="field" id="aname" placeholder="Display name (optional)" autocomplete="nickname" maxlength="60">` : ''}
+        ${np ? '' : `<input class="field" id="aemail" type="email" placeholder="Email" autocomplete="email" value="${esc(A.email)}">`}
+        ${reset ? '' : `<input class="field" id="apass" type="password" placeholder="${up||np ? 'Password (8+ characters)' : 'Password'}" autocomplete="${up||np ? 'new-password' : 'current-password'}">`}
+        ${A.msg ? `<div class="amsg ${A.err?'err':''}">${esc(A.msg)}</div>` : ''}
+        <button class="qs" type="submit" style="margin-top:18px" ${A.busy?'disabled':''}>${A.busy ? 'Please wait…' : up ? 'Create account' : reset ? 'Send reset link' : np ? 'Save password' : 'Sign in'} <span style="display:grid">${I.arrow}</span></button>
+      </form>
+      <div class="grow"></div>
+      <div class="obfoot" style="padding-top:12px">
+        ${np ? '' : `<div class="signin">${up ? 'Already have an account? <b data-amode="signin">Sign in</b>' : 'New to ScoreLine? <b data-amode="signup">Create account</b>'}</div>`}
+        ${A.mode==='signin' ? `<div class="signin" style="margin-top:8px"><b data-amode="reset">Forgot password?</b></div>` : ''}
+        ${reset ? `<div class="signin" style="margin-top:8px"><b data-amode="signin">Back to sign in</b></div>` : ''}
+        <button class="signin" data-authclose style="background:none;border:0;cursor:pointer;margin-top:10px">Cancel</button>
+      </div>`;
+  $('#modal').innerHTML = `<div class="ob"><div class="sheet">${body}</div></div>`;
+  const f = $('#authform'); if (f) f.onsubmit = submitAuth;
+  const first = $('#aemail') && !A.email ? $('#aemail') : $('#apass'); if (first && !A.busy) first.focus();
+}
+async function submitAuth(e){
+  e.preventDefault();
+  const email = ($('#aemail')?.value || AUTH.email || '').trim(), pass = $('#apass')?.value || '', name = ($('#aname')?.value || '').trim();
+  AUTH.email = email;
+  if (AUTH.mode!=='newpass' && !/^\S+@\S+\.\S+$/.test(email)) return authMsg('Enter a valid email address.', true);
+  if ((AUTH.mode==='signup' || AUTH.mode==='newpass') && pass.length < 8) return authMsg('Use at least 8 characters for your password.', true);
+  if (AUTH.mode==='signin' && !pass) return authMsg('Enter your password.', true);
+  AUTH.busy = true; AUTH.msg = ''; drawAuth();
+  const redirect = location.origin + location.pathname;
+  try {
+    let r;
+    if (AUTH.mode==='signin') r = await sb.auth.signInWithPassword({email, password:pass});
+    else if (AUTH.mode==='signup') r = await sb.auth.signUp({email, password:pass, options:{data: name ? {display_name:name} : {}, emailRedirectTo:redirect}});
+    else if (AUTH.mode==='reset') r = await sb.auth.resetPasswordForEmail(email, {redirectTo:redirect});
+    else r = await sb.auth.updateUser({password:pass});
+    if (r.error) return authMsg(friendlyAuthError(r.error), true);
+    if (AUTH.mode==='signup' && !(r.data && r.data.session)) return authMsg(`Almost there: check ${email} for a confirmation link, then sign in.`, false);
+    if (AUTH.mode==='reset') return authMsg('If that email has an account, a reset link is on its way.', false);
+    const done = AUTH.mode==='newpass' ? 'Password updated' : AUTH.mode==='signup' ? 'Account created' : 'Signed in';
+    AUTH.busy = false; AUTH.from = null; $('#modal').innerHTML = ''; info(done);
+  } catch(err){ authMsg(NET_MSG, true); }
+}
+if (sb){
+  sb.auth.onAuthStateChange((event, session) => {
+    const prev = USER; USER = session ? session.user : null;
+    if (event === 'PASSWORD_RECOVERY'){ openAuth('newpass'); return; }
+    if (USER && ((event === 'SIGNED_IN' && !prev) || event === 'INITIAL_SESSION')) setTimeout(()=>pullAccount(event === 'SIGNED_IN'), 0);
+    if (event === 'SIGNED_OUT'){ PROFILE = null; info('Signed out'); }
+    if ($('#main')) setTimeout(reRender, 0);
+  });
+}
 
 /* ================= notifications ================= */
 function note(m, msg, kind){
@@ -682,7 +823,11 @@ function vTeam(id){
 function vFollowing(){
   S.unread = 0; updateBell();
   const teams = F.teams.map(id=>TEAMS[id]).filter(Boolean), lgs = F.leagues.map(id=>LG[id]).filter(Boolean);
-  let html = `<div class="sec">Teams you follow</div><div class="card">${teams.length ? teams.map(t=>`<div class="litem" data-go="team:${t.id}">${badge(t,'md')}<div class="meta"><b>${esc(t.name)}</b><small>${esc(LG[t.lg].name)}</small></div><button class="star on" data-fav="teams:${t.id}">${I.star}</button></div>`).join('') : `<div class="empty">No teams yet. <button class="fbtn" data-onboard>Pick teams</button></div>`}</div>`;
+  const who = USER ? (PROFILE && PROFILE.display_name) || USER.email : '';
+  let html = USER
+    ? `<div class="sec">Account</div><div class="card"><div class="acct"><span class="avatar">${esc((who||'?').trim().charAt(0).toUpperCase())}</span><div class="meta" style="flex:1;min-width:0"><b>${esc(who)}</b><small style="display:block;color:var(--muted);overflow:hidden;text-overflow:ellipsis">${esc(USER.email)} · Teams and alerts synced</small></div><button class="fbtn" style="margin:0" data-signout>Sign out</button></div></div>`
+    : `<div class="sec">Account</div><div class="card"><div class="acct"><span class="avatar" style="background:var(--chip);color:var(--text)">${I.star}</span><div class="meta" style="flex:1"><b>Sign in to sync</b><small style="display:block;color:var(--muted)">Keep your teams and alerts on every device.</small></div><button class="fbtn on" style="margin:0" data-auth="signin">Sign in</button></div></div>`;
+  html += `<div class="sec">Teams you follow</div><div class="card">${teams.length ? teams.map(t=>`<div class="litem" data-go="team:${t.id}">${badge(t,'md')}<div class="meta"><b>${esc(t.name)}</b><small>${esc(LG[t.lg].name)}</small></div><button class="star on" data-fav="teams:${t.id}">${I.star}</button></div>`).join('') : `<div class="empty">No teams yet. <button class="fbtn" data-onboard>Pick teams</button></div>`}</div>`;
   if (lgs.length) html += `<div class="sec">Competitions you follow</div><div class="card">${lgs.map(L=>`<div class="litem" data-go="league:${L.id}"><div class="meta"><b>${esc(L.name)}</b><small>${esc(L.country)}</small></div><button class="star on" data-fav="leagues:${L.id}">${I.star}</button></div>`).join('')}</div>`;
   const tg = (k, t, d) => `<div class="toggle" data-pref="${k}"><div><b>${t}</b><small>${d}</small></div><span class="sw ${P[k]?'on':''}"></span></div>`;
   html += `<div class="sec">Alert settings</div><div class="card">
@@ -737,7 +882,7 @@ function drawOb(){
   if (OB.step==='welcome'){
     body = `<div class="hero"><div class="logo">${LOGO}</div><h1>Changing how you follow sport.</h1></div>
       <div class="obfoot"><button class="qs" data-qs>Quick Setup <span style="display:grid">${I.arrow}</span></button>
-      <div class="signin">${OB.msg ? 'Accounts arrive in v1.0. For now your favourites are saved on this device.' : 'Already a user? <b data-signin>Sign in</b>'}</div>
+      <div class="signin">${USER ? `Signed in as <b>${esc(USER.email)}</b>` : 'Already a user? <b data-signin>Sign in</b>'}</div>
       <button class="signin" data-obskip style="background:none;border:0;cursor:pointer;margin-top:10px">Skip</button></div>`;
   } else if (OB.step==='teams'){
     const segs = [['local','Local'],['suggested','Suggested'],['all','All teams']];
@@ -785,7 +930,7 @@ function render(scrollTop){
   if (fid && (fid==='hq'||fid==='q')){ const el = $('#'+fid); if (el){ el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }
 }
 document.addEventListener('click', e => {
-  const t = e.target.closest('[data-fav],[data-go],[data-tab],[data-sport],[data-date],[data-filter],[data-mtab],[data-ltab],[data-pref],[data-theme],[data-ob],[data-obdone],[data-obskip],[data-onboard],[data-collapse],[data-today],[data-seg],[data-obnext],[data-signin],[data-qs],[data-clear]');
+  const t = e.target.closest('[data-fav],[data-go],[data-tab],[data-sport],[data-date],[data-filter],[data-mtab],[data-ltab],[data-pref],[data-theme],[data-ob],[data-obdone],[data-obskip],[data-onboard],[data-collapse],[data-today],[data-seg],[data-obnext],[data-signin],[data-qs],[data-clear],[data-auth],[data-amode],[data-authclose],[data-signout]');
   if (!t) return;
   const d = t.dataset;
   if (d.fav){ e.stopPropagation(); const [k,id] = d.fav.split(':'); toggleFollow(k, id.includes('|') ? d.fav.slice(k.length+1) : id); return reRender(); }
@@ -794,16 +939,20 @@ document.addEventListener('click', e => {
   if (d.collapse){ COLLAPSED.has(d.collapse) ? COLLAPSED.delete(d.collapse) : COLLAPSED.add(d.collapse); return reRender(); }
   if (d.today!==undefined){ S.tab='matches'; S.stack=[]; S.date=0; return render(true); }
   if (d.qs!==undefined){ OB.step='teams'; return drawOb(); }
-  if (d.signin!==undefined){ OB.msg=true; return drawOb(); }
+  if (d.signin!==undefined) return openAuth('signin', 'welcome');
+  if (d.auth) return openAuth(d.auth);
+  if (d.amode){ const em = $('#aemail'); if (em) AUTH.email = em.value.trim(); AUTH.mode = d.amode; AUTH.msg = ''; AUTH.err = false; return drawAuth(); }
+  if (d.authclose!==undefined) return closeAuth();
+  if (d.signout!==undefined){ if (sb) sb.auth.signOut(); return; }
   if (d.seg){ OB.seg=d.seg; OB.q=''; return drawOb(); }
-  if (d.obnext!==undefined){ if (OB.step==='teams'){ OB.step='leagues'; return drawOb(); } F.teams=OB.teams; F.leagues=OB.leagues; store.set('follows',F); store.set('onboarded',true); $('#modal').innerHTML=''; return render(true); }
+  if (d.obnext!==undefined){ if (OB.step==='teams'){ OB.step='leagues'; return drawOb(); } F.teams=OB.teams; F.leagues=OB.leagues; store.set('follows',F); store.set('onboarded',true); pushAllFollows(); $('#modal').innerHTML=''; return render(true); }
   if (d.tab){ S.tab = d.tab; S.stack = []; return render(true); }
   if (d.sport){ S.sport = d.sport; return render(); }
   if (d.date!==undefined){ S.date = +d.date; return render(); }
   if (d.filter){ S.filter = d.filter; return render(); }
   if (d.mtab){ S.mtab = d.mtab; return render(); }
   if (d.ltab){ S.ltab = d.ltab; return render(); }
-  if (d.pref){ P[d.pref] = !P[d.pref]; store.set('prefs2', P); applyTheme(); return reRender(); }
+  if (d.pref){ P[d.pref] = !P[d.pref]; store.set('prefs2', P); applyTheme(); pushPref(d.pref); return reRender(); }
   if (d.theme!==undefined){ P.theme = P.theme==='light' ? 'dark' : 'light'; store.set('prefs2', P); applyTheme(); return; }
   if (d.ob){ const [k,id]=d.ob.split(':'); OB[k] = OB[k].includes(id) ? OB[k].filter(x=>x!==id) : [...OB[k], id]; return drawOb(); }
   if (d.obskip!==undefined){ store.set('onboarded', true); $('#modal').innerHTML=''; return render(); }
