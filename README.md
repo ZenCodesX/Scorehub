@@ -46,6 +46,35 @@ The data layer is kept separate from the views so it can be swapped for a real p
 
 See the product requirements document for the full roadmap, architecture and data model.
 
+## Backend: Supabase
+
+Accounts and favourites use the Supabase project **Scorehub** (`dkjyqpkcvczbhddvgpzj`, Tokyo region).
+
+- **Sign-in:** email and password, with sign-up, email confirmation and password reset. Signed-in users' followed teams, competitions and matches, alert settings and theme sync to their account. Signed-out use still works and saves to the device. On first sign-in, anything followed on the device is added to the account.
+- **Keys:** `index.html` contains the project URL and the **publishable** key. Both are safe in a client app. Never put the `service_role` key in the app; it is only for your backend.
+
+### Database (`supabase/migrations/`)
+
+| Group | Tables | Who can write |
+| --- | --- | --- |
+| Sports data | `sports`, `competitions`, `seasons`, `teams`, `season_teams`, `players`, `fixtures`, `fixture_events`, `fixture_stats`, `lineups`, `standings`, `player_season_stats` | Backend only (service role). Everyone can read. |
+| User data | `profiles`, `follows`, `notification_settings`, `push_devices` | Each signed-in user, own rows only (row level security) |
+
+- A sign-up automatically creates a `profiles` row and default `notification_settings`.
+- `fixtures` and `fixture_events` are published to Supabase Realtime for live score updates.
+- `follows (entity_type, entity_id)` is indexed so a push service can quickly find everyone following a team or match.
+- `supabase/seed.sql` loads the 17 competitions, their current seasons and 108 teams. It's safe to re-run.
+
+Apply to another project with the Supabase CLI: `supabase link --project-ref <ref>`, then `supabase db push`, then run `seed.sql`.
+
+### One-time dashboard settings
+
+In the Supabase dashboard, go to **Authentication → URL Configuration**:
+- Set **Site URL** to where the app is hosted, e.g. `https://zencodesx.github.io/Scorehub/`.
+- Add the same address (and `http://localhost:3000` for local testing) under **Redirect URLs**, so confirmation and password-reset emails link back to the app.
+
+Optional: turn on Google or Apple sign-in under **Authentication → Providers**. Those need keys from Google or Apple.
+
 ## Tech
 
-Plain HTML, CSS and JavaScript in one file. No framework, no external requests.
+Plain HTML, CSS and JavaScript in one file, plus `@supabase/supabase-js` from a CDN. Sign-in works when the app is opened from a normal website or local server. The Claude preview blocks outside connections, so the app falls back to device-only storage there.
